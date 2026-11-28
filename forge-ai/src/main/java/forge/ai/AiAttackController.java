@@ -20,6 +20,7 @@ package forge.ai;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import forge.ai.ability.ChangeZoneAi;
 import org.apache.commons.lang3.StringUtils;
 import forge.ai.ability.AnimateAi;
 import forge.game.GameEntity;
@@ -399,6 +400,82 @@ public class AiAttackController {
             }
         }
         return false;
+    }
+
+    /** Trigger params that decide whether it fires: those of CardTraitBase, Trigger and TriggerAttacks. */
+    private static final java.util.Set<String> CONDITION_KEYS = java.util.Set.of(
+            "Condition", "CheckDefinedPlayer", "CheckSVar", "CheckSecondSVar", "IsPresent", "IsPresent2",
+            "Metalcraft", "Delirium", "Threshold", "Hellbent", "Bloodthirst", "FatefulHour", "Monarch", "Revolt", "Blessing",
+            "EnduringStory", "DayTime", "Adamant", "LifeTotal", "ManaSpent", "ManaNotSpent", "ClassLevel",
+            "WerewolfTransformCondition", "WerewolfUntransformCondition",
+            "APlayerHasMoreLifeThanEachOther", "APlayerHasMostCardsInHand",
+            "ResolvedLimit", "ActivationLimit", "GameActivationLimit",
+            "Phase", "PhaseCount", "PlayerTurn", "NotPlayerTurn", "OpponentTurn", "FirstCombat", "TurnCount",
+            "Attacked", "Alone", "FirstAttack", "DefendingPlayerPoisoned", "AttackDifferentPlayers");
+
+    /** Whether a trigger param decides if it fires (see CONDITION_KEYS). */
+    static boolean isConditionKey(final String key) {
+        return CONDITION_KEYS.contains(key);
+    }
+
+    /**
+     * An intervening-if on the trigger, or a condition or "unless" cost on the effect or any ability above it in the chain:
+     * whether it removes anything is not known beforehand.
+     */
+    private static boolean isConditional(final Trigger trigger, final SpellAbility sa) {
+        if (trigger.getMapParams().keySet().stream().anyMatch(CONDITION_KEYS::contains)) {
+            return true;
+        }
+        for (SpellAbility link = sa; link != null; link = link.getParent()) {
+            if (link.getMapParams().keySet().stream()
+                    .anyMatch(key -> key.startsWith("Condition") || "UnlessCost".equals(key))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * "Whenever ~ attacks, exile (or return to hand) up to N target creatures/permanents": the blockers that trigger takes out
+     * of the way. Only those the AI's targeting really picks, since it may prefer another permanent (its own to blink, a
+     * planeswalker or other non-creature), and nothing from a trigger with a condition.
+     */
+    static CardCollection blockersRemovedByAttackTrigger(final Card attacker, final CardCollectionView blockers,
+            final Player defendingPlayer) {
+        final CardCollection removed = new CardCollection();
+        final Player ai = attacker.getController();
+        for (final Trigger trigger : attacker.getTriggers()) {
+            if (!TriggerType.Attacks.equals(trigger.getMode()) || !trigger.hasParam("ValidCard")
+                    || !trigger.matchesValidParam("ValidCard", attacker)) {
+                continue;
+            }
+            for (SpellAbility sa = trigger.ensureAbility(); sa != null; sa = sa.getSubAbility()) {
+                final String dest = sa.getParam("Destination");
+                if (!ApiType.ChangeZone.equals(sa.getApi()) || !"Battlefield".equals(sa.getParam("Origin"))
+                        || !("Exile".equals(dest) || "Hand".equals(dest)) || !sa.usesTargeting()
+                        || isConditional(trigger, sa)) {
+                    continue;
+                }
+                sa.setActivatingPlayer(ai);
+                // Which creatures will attack is still open, and that changes what the targeting sees as a blocker. Count only
+                // what it picks both when this creature attacks alone and when everything that can attacks with it.
+                final CardCollection everyAttacker = CardLists.filter(ai.getCreaturesInPlay(),
+                        c -> CombatUtil.canAttack(c, defendingPlayer));
+                if (!everyAttacker.contains(attacker)) {
+                    everyAttacker.add(attacker);
+                }
+                final CardCollection alone = ChangeZoneAi.predictAttackTriggerTargets(ai, sa, new CardCollection(attacker),
+                        defendingPlayer);
+                final CardCollection together = ChangeZoneAi.predictAttackTriggerTargets(ai, sa, everyAttacker,
+                        defendingPlayer);
+                for (final Card target : alone) {
+                    if (together.contains(target) && blockers.contains(target) && !removed.contains(target)) {
+                        removed.add(target);
+                    }
+                }
+            }
+        }
+        return removed;
     }
 
     /**
@@ -1587,6 +1664,10 @@ public class AiAttackController {
 
             // contains only the defender's blockers that can actually block the attacker
             CardCollection validBlockers = CardLists.filter(defenders, defender1 -> CombatUtil.canBlock(attacker, defender1));
+            // an attack trigger that exiles/bounces a creature (Phelia, #13090) takes the best blocker out of the way
+            if (!validBlockers.isEmpty()) {
+                validBlockers.removeAll(blockersRemovedByAttackTrigger(attacker, validBlockers, defendingOpponent));
+            }
 
             canTrampleOverDefenders = attacker.hasKeyword(Keyword.TRAMPLE) && attacker.getNetCombatDamage() > Aggregates.sum(validBlockers, Card::getNetToughness);
 

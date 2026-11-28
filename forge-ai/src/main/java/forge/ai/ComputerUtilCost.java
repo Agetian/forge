@@ -17,6 +17,7 @@ import com.google.common.collect.Sets;
 import forge.ai.AiCardMemory.MemorySet;
 import forge.ai.ability.AnimateAi;
 import forge.game.Game;
+import forge.game.GameActionUtil;
 import forge.game.ability.AbilityUtils;
 import forge.game.card.*;
 import forge.game.combat.Combat;
@@ -33,6 +34,114 @@ import forge.util.MyRandom;
 import forge.util.TextUtil;
 
 public class ComputerUtilCost {
+
+    /**
+     * A cost that exiles other cards from the hand (Soul Spike, Force of Will, evoke) is not paid with a card that can be cast
+     * right now: Soul Spike exiled Fatal Push, which killed the same mana dork for one mana. A card that is not castable in
+     * the current game state (the only Swamp is tapped, wrong timing) is a fair price, which keeps the emergency plays.
+     */
+    public static boolean checkExileFromHandCost(final Player ai, final Cost cost, final Card source, final SpellAbility sa) {
+        if (cost == null) {
+            return true;
+        }
+        for (final CostPart part : cost.getCostParts()) {
+            if (!(part instanceof CostExile) || part.payCostFromSource()) {
+                continue;
+            }
+            final CostExile exile = (CostExile) part;
+            if (exile.zoneRestriction != 1 || !exile.getFrom().contains(ZoneType.Hand)) {
+                continue;
+            }
+            final CardCollection chosen = ComputerUtil.chooseExileFrom(ai, exile, source, part.getAbilityAmount(sa), sa, false);
+            if (chosen == null) {
+                continue; // not payable at all: the cost check of the play says so
+            }
+            for (final Card c : chosen) {
+                if (canBeCastNow(ai, c, source)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether any way of casting the card is usable right now: its spells and their alternative costs (Snuff Out for 4 life
+     * with a Swamp, evoke), each with its conditions and additional costs.
+     *
+     * @param source the spell that wants to exile the card; it will be on the stack, so it cannot pay for that other card
+     */
+    private static boolean canBeCastNow(final Player ai, final Card c, final Card source) {
+        for (final SpellAbility option : c.getAllPossibleAbilities(ai, true)) {
+            if (!option.isSpell()) {
+                continue;
+            }
+            for (final SpellAbility ab : GameActionUtil.getAdditionalCostSpell(option)) {
+                ab.setActivatingPlayer(ai);
+                // castable now: the timing and restrictions, the whole cost (additional costs, not just the mana) and, for a
+                // spell that must target, something its own AI would aim it at in the current game state
+                if (ab.canPlay() && canPayCost(ab, ai, false) && canPayFromHandWithout(ai, ab, source)
+                        && aiWouldCastNow(ab, ai)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the parts of the cost that take other cards from the hand can be paid without {@code excluded}. Otherwise two
+     * evoke creatures would each count as castable by exiling the other, and neither could ever be evoked.
+     */
+    private static boolean canPayFromHandWithout(final Player ai, final SpellAbility ab, final Card excluded) {
+        for (final CostPart part : ab.getPayCosts().getCostParts()) {
+            if (part.payCostFromSource()) {
+                continue;
+            }
+            final boolean exilesFromHand = part instanceof CostExile && ((CostExile) part).zoneRestriction == 1
+                    && ((CostExile) part).getFrom().contains(ZoneType.Hand);
+            if (!exilesFromHand && !(part instanceof CostDiscard)) {
+                continue;
+            }
+            final String type = part.getType();
+            if ("Hand".equals(type) || "Random".equals(type) || type.contains("+with")) {
+                continue; // not a plain choice of cards: left to the cost check above
+            }
+            final CardCollection others = new CardCollection(ai.getCardsIn(ZoneType.Hand));
+            others.remove(excluded);
+            others.remove(ab.getHostCard());
+            if (CardLists.getValidCards(others, type.split(";"), ai, ab.getHostCard(), ab).size() < part.getAbilityAmount(ab)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Set while one spell's AI is asked about another: a pitch spell asking about a pitch spell must not ask back forever. */
+    private static final ThreadLocal<Boolean> ASKING = new ThreadLocal<>();
+
+    /**
+     * A spell that has to target is only worth keeping when its own AI would cast it now: there is a legal target that is worth
+     * it (Fatal Push needs a creature with mana value 2 or less, 4 with revolt). The AI of the spell reads its script, so this
+     * does not read any param itself.
+     */
+    private static boolean aiWouldCastNow(final SpellAbility ab, final Player ai) {
+        if (!ab.usesTargeting() || ab.getMinTargets() <= 0) {
+            return true;
+        }
+        if (Boolean.TRUE.equals(ASKING.get())) {
+            return false;
+        }
+        ASKING.set(true);
+        try {
+            return SpellApiToAi.Converter.get(ab).canPlayWithSubs(ai, ab).willingToPlay();
+        } catch (final RuntimeException e) {
+            return true; // not known: the card stays protected
+        } finally {
+            ab.resetTargets();
+            ASKING.remove();
+        }
+    }
 
     public static boolean checkExileFromGraveCost(final Cost cost, final Player payer, final SpellAbility sa) {
         CardCollection payingCards = new CardCollection();

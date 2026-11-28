@@ -4,12 +4,14 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multiset;
+import com.google.common.collect.Sets;
 
 import forge.ai.*;
 import forge.card.CardType;
 import forge.card.MagicColor;
 import forge.card.mana.ManaCostShard;
 import forge.game.Game;
+import forge.game.GameActionUtil;
 import forge.game.GameEntity;
 import forge.game.GameObject;
 import forge.game.ability.AbilityKey;
@@ -17,8 +19,10 @@ import forge.game.ability.AbilityUtils;
 import forge.game.ability.ApiType;
 import forge.game.card.*;
 import forge.game.combat.Combat;
+import forge.game.combat.CombatUtil;
 import forge.game.cost.*;
 import forge.game.keyword.Keyword;
+import forge.game.keyword.KeywordInterface;
 import forge.game.mana.ManaCostBeingPaid;
 import forge.game.phase.PhaseHandler;
 import forge.game.phase.PhaseType;
@@ -28,7 +32,10 @@ import forge.game.player.PlayerPredicates;
 import forge.game.spellability.AbilitySub;
 import forge.game.spellability.SpellAbility;
 import forge.game.spellability.TargetRestrictions;
+import forge.game.staticability.StaticAbility;
+import forge.game.staticability.StaticAbilityCantBeCast;
 import forge.game.staticability.StaticAbilityDisableTriggers;
+import forge.game.staticability.StaticAbilityMode;
 import forge.game.staticability.StaticAbilityMustTarget;
 import forge.game.trigger.Trigger;
 import forge.game.trigger.TriggerType;
@@ -736,6 +743,184 @@ public class ChangeZoneAi extends SpellAbilityAi {
         return any;
     }
 
+    /** A creature that could block one of the attackers being declared at its defender, exiled until the end step. */
+    private static boolean takesABlockerOutOfTheWay(final Player ai, final Card c, final PredictedAttack prediction) {
+        if (prediction != null) {
+            // as below, only the creatures of the player that is attacked block (and a teammate under shared team turns)
+            return c.isCreature() && c.getController().sharesTeamWith(prediction.defendingPlayer())
+                    && prediction.attackers().stream().anyMatch(attacker -> CombatUtil.canBlock(attacker, c));
+        }
+        final PhaseHandler ph = ai.getGame().getPhaseHandler();
+        final Combat combat = ph.getCombat();
+        if (!c.isCreature() || combat == null || !ph.is(PhaseType.COMBAT_DECLARE_ATTACKERS, ai)) {
+            return false;
+        }
+        for (final Card attacker : combat.getAttackers()) {
+            // in multiplayer only the creatures of the player that is attacked block (planeswalker and battle defenders
+            // are found through their controller), and under shared team turns (Two-Headed Giant, CR 805.10d) the teammates
+            final GameEntity defender = combat.getDefenderByAttacker(attacker);
+            final Player defendingPlayer = combat.getDefenderPlayerByAttacker(attacker);
+            if (defender != null && c.getController().sharesTeamWith(defendingPlayer) && CombatUtil.canBlock(attacker, c)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether every spell this returns to hand is the card of an opponent who can cast it again right away: the card goes back
+     * to its owner's hand, whoever cast it, and from there is paid with the mana (colors and cost changes included) that is
+     * still untapped now. Reprieve on a Noble Hierarch with plenty of Forests open only costs the player a little mana; against
+     * Counterspell with two Forests it counters.
+     */
+    private static boolean targetsSpellItsOwnerCanRecast(final SpellAbility sa) {
+        final Player ai = sa.getActivatingPlayer();
+        final List<SpellAbility> spells = new ArrayList<>();
+        for (final SpellAbility spell : sa.getTargets().getTargetSpells()) {
+            spells.add(spell);
+        }
+        for (final Card card : sa.getTargets().getTargetCards()) {
+            final SpellAbility spell = ai.getGame().getStack().getSpellMatchingHost(card);
+            if (spell != null) {
+                spells.add(spell);
+            }
+        }
+        if (spells.isEmpty()) {
+            return false;
+        }
+        for (final SpellAbility spell : spells) {
+            final Card card = spell.getHostCard();
+            if (card == null || spell.isCopied()) {
+                return false; // a copy is gone for good when it is returned
+            }
+            final Player owner = card.getOwner(); // not necessarily the one who cast it (cast from exile with Gonti)
+            if (!owner.isOpponentOf(ai) || !canCastAgain(card, owner)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether the owner could cast the card once it is back in hand. Judged on a copy placed there, as GameActionUtil does for
+     * an alternate host: the owner controls it, and what applies to cards in that hand applies to it (Omniscience). The spell on
+     * the stack is left as it is.
+     */
+    private static boolean canCastAgain(final Card card, final Player owner) {
+        final Game game = owner.getGame();
+        game.getTracker().freeze(); // this check should not update the view
+        try {
+            final Card returned = CardCopyService.getLKICopy(card);
+            returned.setController(owner, 0);
+            returned.setLastKnownZone(owner.getZone(ZoneType.Hand));
+            // "can't cast spells from anywhere other than their hands" must not see where it was cast from this time
+            returned.setCastFrom(owner.getZone(ZoneType.Hand));
+            returned.setCastSA(null);
+            returned.clearStaticChangedCardKeywords(false);
+            game.getAction().checkStaticAbilities(false, Sets.newHashSet(returned), new CardCollection(returned));
+            return hasCastableSpell(returned, owner);
+        } finally {
+            game.getAction().checkStaticAbilities(false);
+            game.getTracker().clearDelayed();
+            game.getTracker().unfreeze();
+        }
+    }
+
+    /**
+     * Whether any way of casting the card in hand is available: its spells, their alternative costs (Force of Will by exiling a
+     * blue card) and permissions to cast them. Card#getAllPossibleAbilities does not fit here, as the timing to check is the one
+     * after the card has come back.
+     */
+    private static boolean hasCastableSpell(final Card card, final Player caster) {
+        for (final SpellAbility spell : card.getSpellAbilities()) {
+            final ZoneType zone = spell.getRestrictions().getZone();
+            if (!spell.isSpell() || (zone != null && zone != ZoneType.Hand)) {
+                continue;
+            }
+            spell.setActivatingPlayer(caster);
+            spell.resetTargets(); // those of the spell on the stack say nothing about what casting it again costs
+            final List<SpellAbility> options = Lists.newArrayList(spell);
+            // this also checks the conditions of the alternative cost (the Swamp of Snuff Out)
+            options.addAll(GameActionUtil.getAlternativeCosts(spell, caster, false));
+            for (final SpellAbility option : options) {
+                for (final SpellAbility recast : withAdditionalCostChoices(option)) {
+                    recast.setActivatingPlayer(caster);
+                    if (recast.isSpell() && canCastWith(recast, card, caster)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * One ability per choice of an "as an additional cost, X or Y" spell, otherwise the ability itself.
+     * GameActionUtil#getAdditionalCostSpell drops every choice here, because the card is not in a zone it can be cast from.
+     */
+    private static List<SpellAbility> withAdditionalCostChoices(final SpellAbility sa) {
+        final List<SpellAbility> choices = new ArrayList<>();
+        for (final KeywordInterface inst : sa.getHostCard().getKeywords()) {
+            final String keyword = inst.getOriginal();
+            if (keyword.startsWith("AlternateAdditionalCost")) {
+                for (final String cost : keyword.split(":", 2)[1].split(":")) {
+                    final SpellAbility copy = sa.copy();
+                    copy.getPayCosts().add(new Cost(cost, false));
+                    choices.add(copy);
+                }
+            }
+        }
+        return choices.isEmpty() ? List.of(sa) : choices;
+    }
+
+    /**
+     * The whole of casting the returned card with this ability: its timing (once the stack is empty again, which is when it
+     * comes back), who may activate it, its own restrictions, effects that prohibit casting it (Abeyance, Rule of Law), and the
+     * full cost (the sacrifice of Culling the Weak, not just its mana).
+     */
+    private static boolean canCastWith(final SpellAbility recast, final Card card, final Player caster) {
+        final PhaseHandler ph = caster.getGame().getPhaseHandler();
+        final boolean sorceryTiming = ph.isPlayerTurn(caster) && ph.getPhase().isMain();
+        if (!sorceryTiming && !recast.withFlash(card, caster)) {
+            return false;
+        }
+        // a spell without a mana cost cannot be cast for it (Ancestral Vision)
+        final Cost cost = recast.getPayCosts();
+        if (cost.hasManaCost() && cost.getCostMana().getMana().isNoCost()) {
+            return false;
+        }
+        return recast.getRestrictions().checkActivatorRestrictions(card, recast)
+                && recast.getRestrictions().checkTimingRestrictions(card, recast)
+                && recast.getRestrictions().checkOtherRestrictions(card, recast, caster)
+                && isAllowedOnceReturned(recast, card, caster, sorceryTiming)
+                && ComputerUtilCost.canPayCost(recast, caster, false);
+    }
+
+    /**
+     * SpellAbility#checkRestrictions, except for "only any time they could cast a sorcery" (Teferi): that is judged with the
+     * stack as it is now, never empty here, so at sorcery timing it does not stand in the way of casting the card again.
+     */
+    private static boolean isAllowedOnceReturned(final SpellAbility recast, final Card card, final Player caster,
+            final boolean sorceryTiming) {
+        if (recast.checkRestrictions(card, caster)) {
+            return true;
+        }
+        if (!sorceryTiming) {
+            return false;
+        }
+        final CardCollection sources = new CardCollection(caster.getGame().getCardsIn(ZoneType.STATIC_ABILITIES_SOURCE_ZONES));
+        sources.add(card);
+        for (final Card source : sources) {
+            for (final StaticAbility st : source.getStaticAbilities()) {
+                if (!st.hasParam("OnlySorcerySpeed") && st.checkConditions(StaticAbilityMode.CantBeCast)
+                        && StaticAbilityCantBeCast.applyCantBeCastAbility(st, recast, card, caster)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     private static AiAbilityDecision knownOriginCanPlayAI(final Player ai, final SpellAbility sa) {
         // Retrieve either this card, or target Cards in Graveyard
 
@@ -751,6 +936,11 @@ public class ChangeZoneAi extends SpellAbilityAi {
         if (sa.usesTargeting()) {
             if (!isPreferredTarget(ai, sa, false, false)) {
                 return new AiAbilityDecision(0, AiPlayDecision.TargetingFailed);
+            }
+            if (origin.contains(ZoneType.Stack) && destination == ZoneType.Hand && targetsSpellItsOwnerCanRecast(sa)) {
+                // Reprieve on a Noble Hierarch with plenty of lands open only costs the player a little mana (#13103)
+                sa.resetTargets();
+                return new AiAbilityDecision(0, AiPlayDecision.WouldBeRecast);
             }
             if (ComputerUtilAbility.hasUnpromisedGiftReturn(sa)) {
                 for (final Card target : sa.getTargets().getTargetCards()) {
@@ -960,6 +1150,36 @@ public class ChangeZoneAi extends SpellAbilityAi {
      * @return a boolean.
      */
     private static boolean isPreferredTarget(final Player ai, final SpellAbility sa, final boolean mandatory, boolean immediately) {
+        return isPreferredTarget(ai, sa, mandatory, immediately, null);
+    }
+
+    /** An attack that is only being considered: these creatures attacking this player, or its planeswalkers and battles. */
+    private record PredictedAttack(CardCollectionView attackers, Player defendingPlayer) {
+    }
+
+    /**
+     * What the AI would target with an attack trigger if these creatures attacked, chosen by the same code that chooses when the
+     * trigger is put on the stack, including its preference for its own permanents or a non-creature. Works on a copy of the
+     * ability. Empty when the choice cannot be known beforehand.
+     */
+    public static CardCollection predictAttackTriggerTargets(final Player ai, final SpellAbility sa,
+            final CardCollectionView attackers, final Player defendingPlayer) {
+        // these are targeted by other code, or by someone else
+        if (sa.isHidden() || sa.hasParam("AILogic") || sa.hasParam("TargetingPlayer") || sa.hasParam("TargetsAtRandom")
+                || "X".equals(sa.getTargetRestrictions().getMinTargets())) {
+            return new CardCollection();
+        }
+        final SpellAbility copy = sa.copy(ai);
+        copy.setTrigger(sa.getRootAbility().getTrigger());
+        if (!isPreferredTarget(ai, copy, false, true, new PredictedAttack(attackers, defendingPlayer))) {
+            return new CardCollection();
+        }
+        return new CardCollection(copy.getTargets().getTargetCards());
+    }
+
+    /** @param prediction null for a real choice; otherwise only a prediction, which must leave no trace in the AI's memory */
+    private static boolean isPreferredTarget(final Player ai, final SpellAbility sa, final boolean mandatory, boolean immediately,
+            final PredictedAttack prediction) {
         final Card source = sa.getHostCard();
         final List<ZoneType> origin = Lists.newArrayList();
         if (sa.hasParam("Origin")) {
@@ -1110,7 +1330,7 @@ public class ChangeZoneAi extends SpellAbilityAi {
                             CardLists.filter(ai.getOpponents().getCardsIn(ZoneType.Battlefield), CardPredicates.CREATURES).size() + ai.getOpponentsGreatestLifeTotal() + 10;
 
                     // remember that the card was bounced already unless it's a special combo case
-                    if (!saheeliFelidarCombo) {
+                    if (!saheeliFelidarCombo && prediction == null) {
                         rememberBouncedThisTurn(ai, tobounce);
                     }
 
@@ -1148,7 +1368,9 @@ public class ChangeZoneAi extends SpellAbilityAi {
                             return aura.getController().isOpponentOf(ai);
                         }
                         if (blink) {
-                            return c.isToken();
+                            // a token never comes back; any other creature that could block comes back at the end step, which is
+                            // all of the attack it has to be out of the way for (Phelia, #13090)
+                            return c.isToken() || takesABlockerOutOfTheWay(ai, c, prediction);
                         }
                         return c.isToken() || c.getCMC() > 0;
                     });
